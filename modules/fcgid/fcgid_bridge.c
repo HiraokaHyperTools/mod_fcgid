@@ -536,6 +536,7 @@ static int add_request_body(request_rec *r, apr_pool_t *request_pool,
     fcgid_server_conf *sconf = ap_get_module_config(r->server->module_config,
                                                     &fcgid_module);
     int seen_eos = 0;
+    char sizestr[21];
 
     /* Stdin header and body */
     /* I have to read all the request into memory before sending it
@@ -715,6 +716,10 @@ static int add_request_body(request_rec *r, apr_pool_t *request_pool,
     apr_brigade_destroy(input_brigade);
     apr_brigade_destroy(tmp_brigade);
 
+    apr_snprintf(sizestr, sizeof sizestr, "%" APR_OFF_T_FMT, request_size);
+    apr_table_set(r->subprocess_env, "CONTENT_LENGTH", sizestr);
+    apr_table_unset(r->subprocess_env, "HTTP_TRANSFER_ENCODING");
+
     /* Append an empty body stdin header */
     stdin_request_header = apr_bucket_alloc(sizeof(FCGI_Header),
                                             r->connection->bucket_alloc);
@@ -734,25 +739,16 @@ static int add_request_body(request_rec *r, apr_pool_t *request_pool,
 
 int bridge_request(request_rec * r, int role, fcgid_cmd_conf *cmd_conf)
 {
-    apr_bucket_brigade *output_brigade;
+    apr_bucket_brigade *output_brigade, *header_brigade;
     apr_bucket *bucket_eos;
-    char **envp = ap_create_environment(r->pool,
-                                        r->subprocess_env);
     int rc;
+	char **envp;
 
     /* Create brigade for the request to fastcgi server */
     output_brigade =
         apr_brigade_create(r->pool, r->connection->bucket_alloc);
-
-    /* Build the begin request and environ request, append them to output_brigade */
-    if (!build_begin_block
-        (role, r, r->connection->bucket_alloc, output_brigade)
-        || !build_env_block(r, envp, r->connection->bucket_alloc,
-                            output_brigade)) {
-        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
-                      "mod_fcgid: can't build begin or env request");
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
+    header_brigade =
+        apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
     if (role == FCGI_RESPONDER) {
         rc = add_request_body(r, r->pool, output_brigade);
@@ -760,6 +756,21 @@ int bridge_request(request_rec * r, int role, fcgid_cmd_conf *cmd_conf)
             return rc;
         }
     }
+
+    envp = ap_create_environment(r->pool,
+                                        r->subprocess_env);
+
+    /* Build the begin request and environ request, append them to output_brigade */
+    if (!build_begin_block
+        (role, r, r->connection->bucket_alloc, header_brigade)
+        || !build_env_block(r, envp, r->connection->bucket_alloc,
+                            header_brigade)) {
+        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
+                      "mod_fcgid: can't build begin or env request");
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    APR_BRIGADE_PREPEND(output_brigade,header_brigade);
 
     /* The eos bucket now */
     bucket_eos = apr_bucket_eos_create(r->connection->bucket_alloc);
